@@ -299,32 +299,20 @@ func (d cephRBDVolumeDriver) RemoveInternal(r *volume.RemoveRequest) error {
 
 		// defer d.unlockImage(pool, name, locker)
 	} else if d.defaultRemoveAction == "rename" {
-		images, err := d.rbdPoolImageList(pool)
+		logrus.Debugf("Renaming RBD Image %s/%s in Ceph Cluster to zz_ prefix", pool, name)
+		// TODO: maybe add a timestamp?
+		err = d.renameRBDImage(pool, name, "zz_"+name)
 		if err != nil {
-			msg := fmt.Sprintf("error getting volume image list from pool %s: %s", pool, err)
-			logrus.Error(msg)
-			return errors.New(msg)
-		}
-		backupName, err := generateImageBackupName(name, images)
-		if err != nil {
-			msg := fmt.Sprintf("error generating image backup name to %s: %s", name, err)
-			logrus.Error(msg)
-			return errors.New(msg)
-		}
-
-		logrus.Debugf("Renaming RBD Image %s/%s in Ceph Cluster to %s/%s", pool, name, pool, backupName)
-		err = d.renameRBDImage(pool, name, backupName)
-		if err != nil {
-			errString := fmt.Sprintf("Unable to rename RBD Image %s/%s to %s/%s: %s", pool, name, pool, backupName, err)
+			errString := fmt.Sprintf("Unable to rename RBD Image %s/%s with zz_ prefix: %s", pool, name, err)
 			logrus.Errorf(errString)
 			// unlock by old name
 			// defer d.unlockImage(pool, name, locker)
 			return errors.New(errString)
 		} else {
-			logrus.Infof("RBD Image %s/%s renamed successfully to %s/%s", pool, name, pool, backupName)
+			logrus.Infof("RBD Image %s/%s renamed successfully to %s/zz_%s", pool, name, pool, name)
 		}
 		// unlock by new name
-		// defer d.unlockImage(pool, backupName, locker)
+		// defer d.unlockImage(pool, "zz_"+name, locker)
 		// } else {
 		// ignore the remove call - but unlock ?
 		// defer d.unlockImage(pool, name, locker)
@@ -411,17 +399,6 @@ func (d cephRBDVolumeDriver) MountInternal(r *volume.MountRequest) (*volume.Moun
 				fstype = d.defaultImageFSType
 			}
 
-			// check for mountdir - create if necessary
-			err = os.MkdirAll(mountpath, os.ModeDir|os.FileMode(int(0775)))
-			if err != nil {
-				logrus.Errorf("error creating mount directory %s: %s", mountpath, err)
-				// failsafe: need to release lock and unmap kernel device
-				logrus.Debugf("unmapping device")
-				defer d.unmapImageDevice(device)
-				// defer d.unlockImage(pool, name, locker)
-				return nil, errors.New(fmt.Sprintf("Unable to create mountdir %s", mountpath))
-			}
-
 			// double check image filesystem if possible
 			err = d.checkDeviceFilesystem(device, mountpath, fstype, readonly)
 			if err != nil {
@@ -431,6 +408,17 @@ func (d cephRBDVolumeDriver) MountInternal(r *volume.MountRequest) (*volume.Moun
 				defer d.unmapImageDevice(device)
 				// defer d.unlockImage(pool, name, locker)
 				return nil, errors.New(fmt.Sprintf("Image filesystem has errors. Mount it in a separate machine and perform manual repairs. err=%s", err))
+			}
+
+			// check for mountdir - create if necessary
+			err = os.MkdirAll(mountpath, os.ModeDir|os.FileMode(int(0775)))
+			if err != nil {
+				logrus.Errorf("error creating mount directory %s: %s", mountpath, err)
+				// failsafe: need to release lock and unmap kernel device
+				logrus.Debugf("unmapping device")
+				defer d.unmapImageDevice(device)
+				// defer d.unlockImage(pool, name, locker)
+				return nil, errors.New(fmt.Sprintf("Unable to create mountdir %s", mountpath))
 			}
 
 			// mount
@@ -485,7 +473,7 @@ func (d cephRBDVolumeDriver) ListInternal() (*volume.ListResponse, error) {
 	logrus.Debugf("API ListInternal")
 
 	logrus.Debugf("Retrieving all images from default RBD Pool %s", d.defaultCephPool)
-	defaultImages, err := d.rbdDefaultPoolImageList()
+	defaultImages, err := d.rbdList()
 	if err != nil {
 		logrus.Errorf("Error getting images from RBD Pool %s: %s", d.defaultCephPool, err)
 		return nil, err
@@ -771,14 +759,9 @@ func (d cephRBDVolumeDriver) UnmountInternal(r *volume.UnmountRequest) error {
 // ***************************************************************************
 //
 
-// rbdDefaultPoolImageList performs an `rbd ls` on the default pool
-func (d cephRBDVolumeDriver) rbdDefaultPoolImageList() ([]string, error) {
-	return d.rbdPoolImageList(d.defaultCephPool)
-}
-
-// rbdPoolImageList performs an `rbd ls` on the pool
-func (d cephRBDVolumeDriver) rbdPoolImageList(pool string) ([]string, error) {
-	result, err := d.rbdsh(pool, "ls")
+// rbdList performs an `rbd ls` on the default pool
+func (d cephRBDVolumeDriver) rbdList() ([]string, error) {
+	result, err := d.rbdsh(d.defaultCephPool, "ls")
 	if err != nil {
 		return nil, err
 	}
@@ -1079,18 +1062,15 @@ func (d cephRBDVolumeDriver) mapImage(pool string, imagename string, readonly bo
 			err := rwMutex.RWLock(ctx)
 			defer cancel()
 			if err != nil {
-				if !strings.Contains(err.Error(), "requested lease not found") {
-					return "", errors.New("Couldn't not acquire write lock for " + pool + "/" + imagename + ". err=" + err.Error())
-				}
+				return "", errors.New("Couldn't not acquire write lock for " + pool + "/" + imagename + ". err=" + err.Error())
 			}
 			logrus.Infof("Got RWLock for %s/%s", pool, imagename)
+
 		} else {
 			err := rwMutex.RLock(ctx)
 			defer cancel()
 			if err != nil {
-				if !strings.Contains(err.Error(), "requested lease not found") {
-					return "", errors.New("Couldn't not acquire read lock for " + pool + "/" + imagename + ". err=" + err.Error())
-				}
+				return "", errors.New("Couldn't not acquire read lock for " + pool + "/" + imagename + ". err=" + err.Error())
 			}
 			logrus.Infof("Got RLock for %s/%s", pool, imagename)
 		}
